@@ -78,7 +78,23 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
         super().__init__()
         self.num_output_chunks = num_output_chunks
         self.ignore_index = ignore_index
-        self.fkl_loss = ForwardKLLoss(ignore_index)
+
+    def non_chunked_forward_kl_loss(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        teacher_prob = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+        inf_mask = torch.isinf(student_logits)
+        student_logprob = F.log_softmax(student_logits, dim=-1, dtype=torch.float32)
+        prod_probs = torch.masked_fill(teacher_prob * student_logprob, inf_mask, 0)
+        x = torch.sum(prod_probs, dim=-1).view(-1)
+        mask = (labels != self.ignore_index).int()
+        non_masked_count = torch.sum(mask.view(-1), dim=0)
+        if non_masked_count == 0:
+            return torch.tensor(0.0, device=x.device), 0
+        return -torch.sum(x * mask.view(-1), dim=0), non_masked_count
 
     def forward(
         self,
@@ -124,9 +140,14 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
         ]
         total_fkl_loss = 0.0
+        total_non_masked_count = 0
         for student_chunk, teacher_chunk, label_chunk in zip(
             student_logits, teacher_logits, labels
         ):
-            total_fkl_loss += self.fkl_loss(student_chunk, teacher_chunk, label_chunk)
+            fkl_loss, non_masked_count = self.non_chunked_forward_kl_loss(
+                student_chunk, teacher_chunk, label_chunk
+            )
+            total_fkl_loss += fkl_loss
+            total_non_masked_count += non_masked_count
 
-        return total_fkl_loss / self.num_output_chunks
+        return total_fkl_loss / total_non_masked_count
